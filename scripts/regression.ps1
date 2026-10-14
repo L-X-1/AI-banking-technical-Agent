@@ -5,16 +5,22 @@
 .DESCRIPTION
     演示前最后一道保险，一键回放自动化验收套件并汇总绿/红报告：
       1. 确保 bank-core:8100 与 agent-service:8200 在线（不在线则启动并等待就绪）；
-      2. 依次执行 bank-core pytest（预期 22 项）→ agent-service pytest（预期 134 项，
-         含渗透 66/66）→ scripts/m3_im_smoke.py 实连冒烟（IM 降级通道转账确认全流程）；
-      3. 汇总输出每套通过数/失败数，失败时列失败用例名；
-      4. 退出码：全部通过 0，任一失败 1。
+      2. bank-core pytest（预期 22 项，conftest 临时库隔离，任意库态可过）；
+      3. 重置 bank 演示库（停 8100 → 删 bank.db* → 重启 bank-core → 就绪轮询）——令 agent
+         E2E 套件在干净的"当日累计"状态下确定性全绿，同日可重复执行；
+      4. agent-service pytest（预期 134 项，含渗透 66/66）；
+      5. scripts/m3_im_smoke.py 实连冒烟（IM 降级通道转账确认全流程，自适应黄/红）；
+      6. 汇总输出每套通过数/失败数，失败时列失败用例名；
+      7. 退出码：全部通过 0，任一失败 1。
 
 .NOTES
     PowerShell 5.1 兼容（不使用 ?? / ?. 等 7+ 语法）；文件以 UTF-8 with BOM 保存防中文乱码。
     沙箱代理会劫持本机 HTTP 请求，所有探测均显式禁用代理（$req.Proxy = $null）。
-    两套 pytest 均跑临时库（conftest 隔离），不会污染演示数据；
-    IM 冒烟会产生一笔真实转账（赵敏 ¥200），演示前请再跑 scripts/reset_demo.ps1 重置数据。
+    agent-service 的 E2E 测试（test_m1_e2e / test_m3_transcripts）按设计写真实 bank 演示库；
+    若不在 agent 套件前重置 bank 库，同日重复执行会因"当日累计转账 > ¥1,000 升红"导致
+    test_flow_yellow_confirm 误报失败——第 3 步重置是同日可重复执行的关键。
+    agent-service(8200) 全程不重启：其 pytest 库由 conftest（AGENT_DB_PATH 临时目录）隔离。
+    回归执行后演示库仍含测试流水，正式演示前须再跑 scripts/reset_demo.ps1 重置数据。
     用法：powershell -ExecutionPolicy Bypass -File scripts/regression.ps1
 #>
 [CmdletBinding()]
@@ -186,12 +192,81 @@ function Restore-PentestReport {
     }
 }
 
+# ── bank 演示库重置（同日重复执行的确定性保障） ──────────────────────────────
+
+function Stop-PortProcesses([int[]]$Ports) {
+    foreach ($port in $Ports) {
+        $conns = @(Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue)
+        if ($conns.Count -eq 0) {
+            Write-Host "  - 端口 $port 无监听进程，跳过"
+            continue
+        }
+        $procIds = $conns | Select-Object -ExpandProperty OwningProcess -Unique
+        foreach ($procId in $procIds) {
+            try {
+                $proc = Get-Process -Id $procId -ErrorAction SilentlyContinue
+                if ($proc -eq $null) { continue }
+                Write-Host "  - 停止端口 $port 进程 PID=$procId ($($proc.ProcessName))"
+                Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
+            } catch {
+                # 容错：进程已退出/无权限时跳过，不阻断流程
+                Write-Host "  - 停止 PID=$procId 失败（容错跳过）：$($_.Exception.Message)"
+            }
+        }
+    }
+    # 等待端口释放（TIME_WAIT 清理），避免重启绑定冲突
+    Start-Sleep -Milliseconds 800
+}
+
+function Reset-BankDemoDatabase {
+    param([int]$ReadyTimeoutSec = 30)
+    # ① 停 8100 端口进程（uvicorn 持有 bank.db，必须先停后删）
+    Stop-PortProcesses -Ports @(8100)
+
+    # ② 删 bank.db*（含 -wal/-shm；bank-core 下次启动自动建表 + 幂等种子）
+    $dbFile = Join-Path $BankCoreDir "data\bank.db"
+    $deleted = 0
+    $files = @(Get-ChildItem -Path "$dbFile*" -ErrorAction SilentlyContinue)
+    foreach ($f in $files) {
+        try {
+            Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue
+            Write-Host "  - 已删除 $($f.Name)"
+            $deleted++
+        } catch {
+            Write-Host "  - 删除 $($f.Name) 失败（容错跳过）：$($_.Exception.Message)"
+        }
+    }
+    if ($deleted -eq 0) {
+        Write-Host "  - bank.db 不存在，跳过删除"
+    }
+
+    # ③ 重启 bank-core（agent-service:8200 不重启——其测试库由 conftest 隔离）
+    if (-not (Test-Path -LiteralPath $PythonExe)) {
+        throw "managed python 不存在：$PythonExe"
+    }
+    Write-Host "  - 重启 bank-core（uvicorn app.main:app --port 8100）"
+    $uvicornArgs = @("-m", "uvicorn", "app.main:app", "--port", "8100")
+    Start-Process -FilePath $PythonExe -ArgumentList $uvicornArgs `
+        -WorkingDirectory $BankCoreDir -WindowStyle Normal
+
+    # ④ 轮询就绪（GET /api/accounts 可返回即种子数据已写入）
+    $deadline = (Get-Date).AddSeconds($ReadyTimeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        if (Test-Endpoint -Url "$BankCoreUrl/api/accounts" -TimeoutMs 2000) {
+            Write-Ok "bank-core 已重置并就绪（fresh seed）"
+            return $true
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    Write-Bad "bank-core 重置后等待超时（${ReadyTimeoutSec}s）：$BankCoreUrl/api/accounts"
+    return $false
+}
+
 # ── 主流程 ─────────────────────────────────────────────────────────────────
 
 $results = @()
-$fatal = $false
 
-Write-Step "步骤 1/4：确保两服务在线"
+Write-Step "步骤 1/5：确保两服务在线"
 $bankOk = Ensure-ServiceReady -Name "bank-core" -WorkDir $BankCoreDir -Port 8100 -HealthUrl "$BankCoreUrl/health"
 $agentOk = Ensure-ServiceReady -Name "agent-service" -WorkDir $AgentSvcDir -Port 8200 -HealthUrl "$AgentSvcUrl/health"
 if (-not $bankOk -or -not $agentOk) {
@@ -199,14 +274,26 @@ if (-not $bankOk -or -not $agentOk) {
     exit 1
 }
 
-Write-Step "步骤 2/4：bank-core pytest（预期 $ExpectedBankCore 项）"
+Write-Step "步骤 2/5：bank-core pytest（预期 $ExpectedBankCore 项）"
 $results += Invoke-PytestSuite -Name "bank-core pytest" -WorkDir $BankCoreDir -Expected $ExpectedBankCore
 
-Write-Step "步骤 3/4：agent-service pytest（预期 $ExpectedAgentSvc 项，含渗透 66/66）"
+Write-Step "步骤 3/5：重置 bank 演示库（保障同日重复执行的确定性）"
+$bankResetOk = $false
+try {
+    $bankResetOk = Reset-BankDemoDatabase -ReadyTimeoutSec $ReadyTimeoutSec
+} catch {
+    Write-Bad "bank 演示库重置异常：$($_.Exception.Message)"
+}
+if (-not $bankResetOk) {
+    Write-Bad "bank 演示库重置失败，回归终止（agent E2E 套件依赖干净的当日累计状态）"
+    exit 1
+}
+
+Write-Step "步骤 4/5：agent-service pytest（预期 $ExpectedAgentSvc 项，含渗透 66/66）"
 $results += Invoke-PytestSuite -Name "agent-service pytest" -WorkDir $AgentSvcDir -Expected $ExpectedAgentSvc
 Restore-PentestReport
 
-Write-Step "步骤 4/4：IM 通道实连冒烟（scripts/m3_im_smoke.py）"
+Write-Step "步骤 5/5：IM 通道实连冒烟（scripts/m3_im_smoke.py）"
 $smokeOk = $false
 try {
     # agent-service 部署标准端口 8200，通过环境变量告知冒烟脚本
@@ -248,7 +335,7 @@ foreach ($r in $results) {
 
 if ($allOk) {
     Write-Host "`n回归全绿：3/3 套件通过，可以上台演示。" -ForegroundColor Green
-    Write-Host "提醒：IM 冒烟已产生一笔真实转账（赵敏 ¥200），正式演示前请执行 scripts/reset_demo.ps1 重置演示数据。" -ForegroundColor Yellow
+    Write-Host "提醒：回归执行后演示库含测试流水（agent E2E 六场景 + IM 冒烟），正式演示前请执行 scripts/reset_demo.ps1 重置演示数据。" -ForegroundColor Yellow
     exit 0
 } else {
     Write-Host "`n回归存在失败项，请按上方失败用例修复后再演示。" -ForegroundColor Red
