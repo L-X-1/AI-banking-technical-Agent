@@ -2,16 +2,19 @@
 
 用法：
     python scripts/m3_im_smoke.py
+    # agent-service 非 8000 端口时用环境变量覆盖（部署标准为 8200）：
+    AGENT_URL=http://127.0.0.1:8200 python scripts/m3_im_smoke.py
 输出：IM 文本逐轮打印 + 审计事件回放（doc 05 M3#8 验收：MockImView 页面完成一次转账确认全流程）。
 """
 import json
+import os
 import re
 import sys
 import urllib.error
 import urllib.request
 
-AGENT = "http://127.0.0.1:8000"
-BANK = "http://127.0.0.1:8100"
+AGENT = os.environ.get("AGENT_URL", "http://127.0.0.1:8000")
+BANK = os.environ.get("BANK_URL", "http://127.0.0.1:8100")
 SID = "s_im_smoke_1"
 
 # 沙箱代理会劫持本机请求（agent-service 的 httpx 同样 trust_env=False）：本地冒烟直连禁代理
@@ -35,7 +38,8 @@ def main() -> int:
         try:
             get(f"{svc}/health", timeout=5).read()
         except (urllib.error.URLError, OSError):
-            print(f"[FAIL] {svc} unreachable: start bank-core(:8100) and agent-service(:8000) first")
+            print(f"[FAIL] {svc} unreachable: start bank-core(:8100) and agent-service first; "
+                  f"non-default agent port can be set via AGENT_URL env var")
             return 1
 
     ok = False
