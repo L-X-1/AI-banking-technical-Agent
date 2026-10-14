@@ -29,6 +29,7 @@ logs/
 !agent-service/tests/**/*.jsonl
 *_run.txt
 *_run.err
+*_install.txt
 pytest_*.txt
 pytest_*.err
 
