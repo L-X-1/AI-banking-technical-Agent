@@ -1,0 +1,14 @@
+.git
+.gitignore
+**/__pycache__
+*.pyc
+.pytest_cache
+tests/            # 测试不进镜像（compose 内跑 pytest 属本地/CI 行为）
+data/             # 本地 bank.db 绝不进镜像
+*.db
+*.db-wal
+*.db-shm
+scripts/
+docs/
+*.md
+.env

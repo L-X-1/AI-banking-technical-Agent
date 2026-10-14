@@ -1,0 +1,16 @@
+.git
+.gitignore
+**/__pycache__
+*.pyc
+.pytest_cache
+tests/
+data/
+*.db
+*.db-wal
+*.db-shm
+scripts/
+docs/
+.env
+*.md
+!app/llm/prompts/          # 关键例外：提示词是运行必需，load_prompt 启动即读
+!app/llm/prompts/*.md

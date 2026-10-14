@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>智银 Agent · M1 极简联调页</title>
+<style>
+  body { background:#141414; color:#e6e6e6; font-family:"PingFang SC","Microsoft YaHei",sans-serif; margin:0; padding:24px; }
+  #wrap { max-width:780px; margin:0 auto; }
+  h3 { color:#d4af37; font-weight:600; }
+  #msgs { display:flex; flex-direction:column; gap:10px; min-height:320px; }
+  .m { border:1px solid #2a2a2e; border-radius:10px; background:#1c1c1e; padding:10px 12px; font-size:13px; line-height:1.7; white-space:pre-wrap; }
+  .m.user { border-color:#3f3f46; }
+  .m.tool { color:#8b8b90; font-family:Consolas,monospace; font-size:12px; }
+  .m.card { border-left:3px solid #fbbf24; }
+  .m.card.red { border-left-color:#f87171; }
+  .m.sms { border-left:3px solid #d4af37; color:#fbbf24; font-family:Consolas,monospace; }
+  .row { display:flex; justify-content:space-between; padding:2px 0; color:#a1a1aa; }
+  .row b { color:#e6e6e6; font-family:Consolas,monospace; }
+  .btns { display:flex; gap:10px; margin-top:10px; }
+  button { flex:1; padding:8px 0; border-radius:8px; border:1px solid #3f3f46; background:#26262a; color:#e6e6e6; cursor:pointer; }
+  button.pri { background:#d4af37; color:#141414; border-color:#d4af37; font-weight:600; }
+  #inbox { display:flex; gap:8px; margin-top:16px; }
+  #text { flex:1; padding:11px 14px; border-radius:10px; border:1px solid #3f3f46; background:#1c1c1e; color:#e6e6e6; font-size:13.5px; }
+  #bar { margin-top:8px; font-size:11.5px; color:#71717a; display:flex; justify-content:space-between; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <h3>智银 Agent · M1 极简联调页</h3>
+  <div id="msgs"></div>
+  <div id="inbox"><input id="text" placeholder="试试：给赵敏转 200，备注聚餐 AA / 给李磊转 5000 / 余额" autofocus>
+    <button class="pri" style="flex:none;padding:0 18px;" onclick="send()">发送</button></div>
+  <div id="bar"><span id="status">连接中…</span><span>同一 Agent 同一 trace · 审计 /api/audit/{trace_id}</span></div>
+</div>
+<script>
+const sid = "s_demo_" + Math.floor(Math.random() * 1000);
+const ws = new WebSocket(`ws://${location.host}/ws/web?session=${sid}`);
+const msgs = document.getElementById("msgs");
+const statusEl = document.getElementById("status");
+
+ws.onopen = () => statusEl.textContent = "已连接 · " + sid;
+ws.onmessage = (e) => add(JSON.parse(e.data));
+
+function el(html) { const d = document.createElement("div"); d.className = "m"; d.innerHTML = html; msgs.appendChild(d); return d; }
+
+function add(m) {
+  const p = m.payload || {};
+  if (m.type === "session_ready") return;
+  if (m.type === "status") { statusEl.textContent = "会话状态：" + p.status; return; }
+  if (m.type === "tool_progress") return el(`⏺ ${p.tool} · ${p.status} · ${p.duration_ms}ms<br>⎿ ${p.result_summary}`).classList.add("tool");
+  if (m.type === "confirm_card") {
+    const rows = (p.detail || []).map(d => `<div class="row"><span>${d.label}</span><b>${d.value}</b></div>`).join("");
+    const d = el(`<b>需要您的确认（${p.risk_level === "red" ? "红色·需 MFA" : "黄色操作"}）</b>${rows}
+      <div class="row"><span>后果</span><span>${p.consequence}</span></div>
+      <div class="row"><span>依据</span><span>${(p.upgrade_reasons || []).join("；")}</span></div>
+      <div class="btns"><button class="pri" onclick="confirm_(${JSON.stringify(p.action_id)}, true)">确认</button>
+      <button onclick="confirm_(${JSON.stringify(p.action_id)}, false)">取消</button></div>`);
+    d.classList.add("card"); if (p.risk_level === "red") d.classList.add("red"); return d;
+  }
+  if (m.type === "mfa_request") {
+    const d = el(`<b>🔐 多因子认证 · 短信验证（${p.expires_in_sec}s）</b>
+      <div class="row"><span>手机号</span><b>${p.target_masked}</b></div>
+      <div id="mfa-box-${p.challenge_id}"><input id="mfa-${p.challenge_id}" placeholder="输入 6 位验证码" style="margin-top:8px;padding:8px;width:60%;background:#141414;border:1px solid #f87171;color:#e6e6e6;border-radius:8px;">
+      <button class="pri" style="margin-top:8px;" onclick="mfa_('${p.challenge_id}')">提交验证</button></div>`);
+    d.classList.add("card", "red"); return d;
+  }
+  if (m.type === "mfa_sms") return el(String(p.content)).classList.add("sms");
+  if (m.type === "notify") return el(`📣 <b>${p.title}</b><br>${p.content}`).classList.add("sms");
+  if (m.type === "clarify_options") {
+    const opts = (p.options || []).map(o => `<div class="row"><span>${o.primary}</span><span>${o.secondary}</span></div>`).join("");
+    return el(`<b>${p.question}</b>${opts}<div style="color:#71717a;margin-top:6px;">回复尾号或备注即可选择</div>`).classList.add("card");
+  }
+  if (m.type === "receipt") return el(`✓ ${p.title}｜${p.counterparty || ""}｜${p.detail.map(x => x.value).join(" · ")}`).classList.add("card");
+  if (m.type === "error") return el(`⚠ ${p.message}`).classList.add("card", "red");
+  if (m.type === "final") return el(p.text);
+  return el(JSON.stringify(m));
+}
+
+function send() {
+  const t = document.getElementById("text"); const v = t.value.trim(); if (!v) return;
+  el(v).classList.add("user"); ws.send(JSON.stringify({ type: "user_message", text: v })); t.value = "";
+}
+function confirm_(actionId, approved) { ws.send(JSON.stringify({ type: "action_confirm", action_id: actionId, approved })); }
+function mfa_(challengeId) { const v = document.getElementById("mfa-" + challengeId).value; ws.send(JSON.stringify({ type: "mfa_submit", challenge_id: challengeId, code: v })); }
+document.getElementById("text").addEventListener("keydown", e => { if (e.key === "Enter") send(); });
+</script>
+</body>
+</html>

@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Node
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Env & secrets
+.env
+.env.*
+!.env.example
+*.local
+
+# Data & logs
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite3
+logs/
+*.log
+**/data/*.jsonl
+!agent-service/tests/**/*.jsonl
+*_run.txt
+*_run.err
+pytest_*.txt
+pytest_*.err
+
+# Test & coverage
+.coverage
+coverage/
+htmlcov/
+
+# OS 垃圾文件
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
